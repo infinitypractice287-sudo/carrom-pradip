@@ -5292,12 +5292,16 @@ window.CARROM = {
      ONLINE PLAY  —  two phones, one table
      --------------------------------------------------------------
      Transport : WebRTC data channel (PeerJS for the handshake).
-     Authority : the HOST runs the real physics. The guest sends its
-                 shot (striker spot, angle, power); the host plays it
-                 and streams every body's position back each frame,
-                 plus the sound/flash events, toasts and the settled
-                 match state. So both phones always show the host's
-                 table — there is nothing to drift apart.
+     Authority : the HOST owns the table (turn hand-off, final
+                 “settled” state, re-rack), but BOTH phones run the
+                 SAME physics locally.  The guest predicts its own
+                 shot instantly and the host sends only a tiny “go”
+                 message when it shoots; no per-frame position
+                 stream is needed, so the guest never jitters even
+                 on a weak mobile link.  The host’s final settled
+                 snapshot re-syncs the two tables at the end of each
+                 shot, and sounds/flashes are produced locally on
+                 each phone.
      Seats     : host = Player 1 (blue, bottom)
                  guest = Player 2 (white, top) — their canvas is turned
                  180° and their touches are mirrored, so they also
@@ -5577,8 +5581,8 @@ window.CARROM = {
       return {
         turn: Game.turn, score: Game.score.slice(), queens: Game.queens.slice(),
         winner: Game.winner, phase: Game.phase, hacks: Game.hacks.slice(),
-        coins: Game.coins.map(c => [c.id, c.type, r1(c.x), r1(c.y), c.pocketed ? 1 : 0, r1(c.pocketTimer || 0)]),
-        striker: [r1(Game.striker.x), r1(Game.striker.y), Game.striker.pocketed ? 1 : 0],
+        coins: Game.coins.map(c => [c.id, c.type, Math.round(c.x*100)/100, Math.round(c.y*100)/100, c.pocketed ? 1 : 0, Math.round((c.pocketTimer||0)*100)/100]),
+        striker: [Math.round(Game.striker.x*100)/100, Math.round(Game.striker.y*100)/100, Game.striker.pocketed ? 1 : 0],
       };
     },
     snapshotLive() {
@@ -5659,10 +5663,11 @@ window.CARROM = {
       if (!m || typeof m !== 'object') return;
       switch (m.t) {
         case 'full':   if (this.role === 'guest') this.applyFull(m.s); break;
-        case 'snap':   if (this.role === 'guest') this.applySnap(m); break;
+        case 'snap':   if (this.role === 'guest') this.applySnap(m); break; // legacy — kept for older peers
+        case 'go':     if (this.role === 'guest') this.guestApplyGo(m); break;
         case 'toast':  ORIG.flashToast(m.msg, m.tone); break;
         case 'win':    if (this.role === 'guest') { Game.winner = m.p; Game.phase = 'over'; ORIG.showWinOverlay(m.p); if (PLAYERS[m.p].name === 'You') elWinTitle.textContent = 'You Win!'; } break;
-        case 'aim':    // the other player is sliding their striker
+        case 'aim':
           if (Game.phase === 'remote' && Game.turn === this.other) {
             Game.striker.x = clamp(m.x, Board.strikerMinX, Board.strikerMaxX);
             Game.striker.y = strikerRowY(this.other);
@@ -5682,6 +5687,9 @@ window.CARROM = {
     hostApplyShot(m) {
       if (Game.turn !== AI_SEAT || Game.winner !== null) return;
       if (Game.phase !== 'remote' && Game.phase !== 'ready') return;
+      // If the host is already simulating (e.g. a delayed duplicate),
+      // ignore the duplicate.
+      if (Game.phase === 'sim') return;
       const s = Game.striker;
       s.x = clamp(+m.x, Board.strikerMinX, Board.strikerMaxX);
       s.y = strikerRowY(AI_SEAT);
@@ -5689,32 +5697,48 @@ window.CARROM = {
       Game.aim.angle = +m.a;
       Game.aim.power = clamp(+m.p, 0, 1);
       Game.aim.active = false;
-      XRay.drawnAim = null;                 // never snap a remote shot onto a local preview
+      XRay.drawnAim = null;
       Game.phase = 'ready';
       ORIG.shoot();
     },
+    guestApplyGo(m) {
+      // host has shot — mirror it and run the same physics locally
+      if (Game.winner !== null) return;
+      if (Game.phase === 'sim') return;              // already rolling
+      if (Game.turn !== this.other) return;
+      if (Game.phase !== 'remote' && Game.phase !== 'ready') return;
+      const s = Game.striker;
+      s.x = clamp(+m.x, Board.strikerMinX, Board.strikerMaxX);
+      s.y = strikerRowY(this.other);
+      s.vx = s.vy = 0;
+      Game.aim.angle = +m.a;
+      Game.aim.power = clamp(+m.p, 0, 1);
+      Game.aim.active = false;
+      XRay.drawnAim = null;
+      Game.phase = 'ready';
+      ORIG.shoot();                                   // smooth 60 fps on the guest too
+    },
 
-    /* ---- per-frame driver ---- */
+    /* ---- per-frame driver — predictive (no per-frame stream) ---- */
     tick(dt) {
       if (!this.active || Mode.kind !== 'online') return;
 
+      const ph = Game.phase;
       if (this.role === 'host') {
-        const ph = Game.phase;
-        if (ph === 'sim') {
-          this.send(this.snapshotLive());
-        } else if (this.prevPhase === 'sim') {
-          // the shot has just been resolved: push the authoritative table
+        // the shot has just settled — authoritatively re-sync once
+        if (this.prevPhase === 'sim' && ph !== 'sim') {
           this.send({ t: 'full', why: 'settled', s: this.snapshotFull() });
         }
         if (ph === 'ready' && Game.turn === AI_SEAT && Game.winner === null) {
-          // hand the table to the guest and wait
           Game.phase = 'remote';
           Game.aim.active = false;
           this.send({ t: 'full', why: 'turn', s: this.snapshotFull() });
         }
         this.prevPhase = Game.phase;
       } else {
-        // guest keeps its own cosmetic timers running while the host simulates
+        // guest: during sim the global frame() drives physics at 60 fps
+        // locally, so no stream is needed. Keep pocket/flash timers alive
+        // only while NOT simulating (physicsStep handles them during sim).
         if (Game.phase !== 'sim') {
           for (const c of Game.coins) if (c.pocketed) c.pocketTimer += dt;
           if (Game.striker.pocketed) Game.striker.pocketTimer += dt;
@@ -5784,48 +5808,37 @@ window.CARROM = {
     if (Net.active && Net.role === 'host' && msg && !/X-Ray Vision|Code rejected/.test(msg))
       Net.send({ t: 'toast', msg, tone: tone || '' });
   };
-  window.flashRespot = function (x, y) {
-    ORIG.flashRespot(x, y);
-    if (Net.active && Net.role === 'host') Net.send({ t: 'snap', b: [], s: [r1(Game.striker.x), r1(Game.striker.y), 0, 0, 0], ev: [['f', r1(x), r1(y)]] });
-  };
-  window.pocketBody = function (b, pocket) {
-    ORIG.pocketBody(b, pocket);
-    if (Net.active && Net.role === 'host') Net.events.push(['d', r1(pocket.x), r1(pocket.y)]);
-  };
-  window.onPieceHit = function (A, B, impactSpeed) {
-    ORIG.onPieceHit(A, B, impactSpeed);
-    if (Net.active && Net.role === 'host' && impactSpeed >= 55) {
-      const level = clamp(impactSpeed / (CFG.STRIKER_POWER * 0.55), 0, 1);
-      Net.events.push(['p', r2(level), r1((A.x + B.x) * 0.5), (A.isStriker || B.isStriker) ? 1 : 0]);
-    }
-  };
-  window.onWallHit = function (b) {
-    ORIG.onWallHit(b);
-    if (Net.active && Net.role === 'host') {
-      const sp = Math.hypot(b.vx, b.vy);
-      if (sp >= CFG.CUSHION_MIN_BOUNCE) Net.events.push(['w', r2(clamp(sp / (CFG.STRIKER_POWER * 0.6), 0, 1)), r1(b.x)]);
-    }
-  };
-  window.onRimHit = function (b) {
-    ORIG.onRimHit(b);
-    if (Net.active && Net.role === 'host') {
-      const sp = Math.hypot(b.vx, b.vy);
-      if (sp >= 200) Net.events.push(['r', r2(clamp(sp / (CFG.STRIKER_POWER * 0.5), 0, 1)), r1(b.x)]);
-    }
-  };
+  // sounds/flashes are now local — both phones run the same physics,
+  // so no need to relay per-hit events. Keeping the wrappers as
+  // thin pass-throughs makes the host/guest code identical in sound.
+  window.flashRespot = function (x, y) { ORIG.flashRespot(x, y); };
+  window.pocketBody  = function (b, pocket) { ORIG.pocketBody(b, pocket); };
+  window.onPieceHit  = function (A, B, impactSpeed) { ORIG.onPieceHit(A, B, impactSpeed); };
+  window.onWallHit   = function (b) { ORIG.onWallHit(b); };
+  window.onRimHit    = function (b) { ORIG.onRimHit(b); };
   const r2 = v => Math.round(v * 100) / 100;
 
-  /* shooting: the guest never simulates — it posts the shot to the host */
+  /* shooting — predictive: both phones run the same physics at 60 fps.
+     No per-frame stream.  The guest starts its own shot immediately
+     (optimistic), the host starts its own shot and sends a tiny “go”
+     so the guest can run the same shot locally.  Either side’s physics
+     is smooth on its own screen; the host’s “settled” snapshot
+     re-syncs at the end. */
   window.shoot = function () {
     if (Net.active && Net.role === 'guest') {
       if (Game.phase !== 'ready' || Game.turn !== AI_SEAT) return;
-      Net.send({ t: 'shot', x: r1(Game.striker.x), a: Game.aim.angle, p: clamp(Game.aim.power, 0, 1) });
-      Game.phase = 'remote';
-      resetAim();
-      syncHud();
+      const _a = Game.aim.angle, _p = clamp(Game.aim.power, 0, 1), _x = Math.round(Game.striker.x*100)/100;
+      Net.send({ t: 'shot', x: _x, a: _a, p: _p });
+      ORIG.shoot();                 // run locally — instant, no network stutter
       return;
     }
+    // host (or offline) — capture before ORIG.shoot() wipes the aim
+    const _wasReady = (Game.phase === 'ready');
+    const _a2 = Game.aim.angle, _p2 = clamp(Game.aim.power, 0, 1), _x2 = Math.round(Game.striker.x*100)/100;
     ORIG.shoot();
+    if (Net.active && Net.role === 'host' && _wasReady && Game.phase === 'sim') {
+      Net.send({ t: 'go', x: _x2, a: _a2, p: _p2 });
+    }
   };
 
   /* re-rack: only the host owns the table */
